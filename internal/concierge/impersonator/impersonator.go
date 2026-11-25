@@ -309,6 +309,11 @@ func newInternal(
 					// Empty string is disallowed because request info has had bugs in the past where it would leave it empty.
 					return authorizer.DecisionDeny, "invalid verb, " + baseReason, nil
 				default:
+					// The login call needs no RBAC grant to system:anonymous; getTransportForUser sends it as our service account.
+					if isAnonymousTokenCredReq(a) {
+						return authorizer.DecisionAllow, "anonymous TokenCredentialRequest, " + baseReason, nil
+					}
+
 					// Since we authenticate the requesting user, we are in the best position to correctly authorize them.
 					// When KAS does the check, it may run the check against our service account and not the requesting user
 					// (due to a bug in the code or any other internal SAR checks that the request processing does).
@@ -493,6 +498,36 @@ func isTokenCredReq(reqInfo *genericapirequest.RequestInfo) bool {
 	}
 
 	return true
+}
+
+// isAnonymousTokenCredReq reports whether a is system:anonymous creating a TokenCredentialRequest.
+func isAnonymousTokenCredReq(a authorizer.Attributes) bool {
+	return a.GetUser() != nil &&
+		a.GetUser().GetName() == user.Anonymous &&
+		a.IsResourceRequest() &&
+		a.GetVerb() == "create" &&
+		a.GetSubresource() == "" &&
+		isTokenCredReq(&genericapirequest.RequestInfo{APIGroup: a.GetAPIGroup(), Resource: a.GetResource()})
+}
+
+// isAnonymousTokenCredReqFromContext applies isAnonymousTokenCredReq to the user and request info in ctx.
+func isAnonymousTokenCredReqFromContext(ctx context.Context) bool {
+	userInfo, ok := genericapirequest.UserFrom(ctx)
+	if !ok {
+		return false
+	}
+	reqInfo, ok := genericapirequest.RequestInfoFrom(ctx)
+	if !ok {
+		return false
+	}
+	return isAnonymousTokenCredReq(authorizer.AttributesRecord{
+		User:            userInfo,
+		Verb:            reqInfo.Verb,
+		APIGroup:        reqInfo.APIGroup,
+		Resource:        reqInfo.Resource,
+		Subresource:     reqInfo.Subresource,
+		ResourceRequest: reqInfo.IsResourceRequest,
+	})
 }
 
 // No-op wrapping around RequestFunc to allow for comparisons.
@@ -721,6 +756,10 @@ func ensureNoImpersonationHeaders(r *http.Request) error {
 }
 
 func getTransportForUser(ctx context.Context, userInfo user.Info, delegate, delegateAnonymous http.RoundTripper, ae *auditEventUserInfo, token string, authenticator authenticator.Request) (http.RoundTripper, error) {
+	if isAnonymousTokenCredReqFromContext(ctx) {
+		return delegate, nil // authorized by customReasonAuthorizer; sent as our service account, without impersonation
+	}
+
 	if canImpersonateFully(userInfo) {
 		return standardImpersonationRoundTripper(userInfo, ae, delegate)
 	}
